@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         PPKE Moodle H5P Auto-Seek (univerzális)
+// @name         PPKE H5P Cheat Sheet + AUTO
 // @namespace    http://tampermonkey.net/
-// @version      2.4
-// @description  Automatikusan olvassa ki az H5P interakciós pontokat az oldalból, és kezeli a helyes/helytelen válaszokat
-// @author       $$$ CLAUDE.AI $$$ (herkr1)
+// @version      2.0
+// @description  Mutatja a kérdések időpontjait és a helyes válaszokat, AUTO móddal ami mindent megcsinál helyetted
+// @author       Claude.ai
 // @match        https://moodle.ppke.hu/mod/hvp/view.php*
 // @grant        none
 // ==/UserScript==
@@ -11,472 +11,725 @@
 (function () {
     'use strict';
 
-    // ── Interakciók kiolvasása ────────────────────────────────────────────────
-    function parseInteractions() {
+    let autoRunning = false;
+    let autoAborted = false;
+
+    // ── Helyes válasz kinyerése kérdéstípusonként ─────────────────────────────
+
+    function extractAnswer(action) {
+        if (!action) return null;
+        const lib = (action.library || '').split(' ')[0];
+        const p = action.params || {};
+
+        switch (lib) {
+
+            case 'H5P.MultiChoice': {
+                const answers = (p.answers || [])
+                    .filter(a => a.correct)
+                    .map(a => stripTags(a.text || ''));
+                return {
+                    type: 'Feleletválasztós',
+                    question: stripTags(p.question || ''),
+                    answers,
+                };
+            }
+
+            case 'H5P.TrueFalse': {
+                return {
+                    type: 'Igaz/Hamis',
+                    question: stripTags(p.question || ''),
+                    answers: [p.correct === 'true' ? 'Igaz ✓' : 'Hamis ✓'],
+                };
+            }
+
+            case 'H5P.Blanks': {
+                // "Fill in the blanks" – a helyes szavak 1:szó1:szó2 formátumban
+                const answers = [];
+                for (const q of (p.questions || [])) {
+                    const text = q.params || q || '';
+                    const matches = String(text).match(/\*([^*]+)\*/g) || [];
+                    for (const m of matches) {
+                        const opts = m.replace(/\*/g, '').split(':').filter(Boolean);
+                        answers.push(opts[0] || opts.join('/'));
+                    }
+                }
+                return {
+                    type: 'Kiegészítős',
+                    question: stripTags(p.text || ''),
+                    answers,
+                };
+            }
+
+            case 'H5P.SingleChoiceSet': {
+                // Az első válasz mindig a helyes
+                const sets = (p.choices || []).map(c => ({
+                    q: stripTags(c.question || ''),
+                    a: stripTags((c.answers || [])[0] || ''),
+                }));
+                return {
+                    type: 'Egyválasztós sor',
+                    question: sets.map(s => s.q).filter(Boolean).join(' / '),
+                    answers: sets.map(s => s.a).filter(Boolean),
+                };
+            }
+
+            case 'H5P.DragQuestion': {
+                const answers = [];
+                for (const el of (p.question?.settings?.elements || [])) {
+                    if (el.dropZones?.length && el.type?.params?.alt) {
+                        answers.push(stripTags(el.type.params.alt));
+                    }
+                }
+                return {
+                    type: 'Húzós',
+                    question: stripTags(p.question?.settings?.question || ''),
+                    answers,
+                };
+            }
+
+            case 'H5P.DragText': {
+                const answers = [];
+                const text = p.textField || '';
+                const matches = text.match(/\*([^*]+)\*/g) || [];
+                for (const m of matches) {
+                    answers.push(m.replace(/\*/g, '').split(':')[0]);
+                }
+                return {
+                    type: 'Szövegbe húzós',
+                    question: '',
+                    answers,
+                };
+            }
+
+            case 'H5P.Summary': {
+                // Az első lista elem a helyes
+                const answers = (p.summaries || []).flatMap(s =>
+                    s.summary ? [stripTags(s.summary[0] || '')] : []
+                );
+                return {
+                    type: 'Összefoglaló',
+                    question: '',
+                    answers,
+                };
+            }
+
+            default:
+                return {
+                    type: lib.replace('H5P.', '') || 'Ismeretlen',
+                    question: '',
+                    answers: [],
+                };
+        }
+    }
+
+    function stripTags(s) {
+        return String(s).replace(/<[^>]*>/g, '').replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').trim();
+    }
+
+    // ── Adatok összegyűjtése ──────────────────────────────────────────────────
+
+    function collectData() {
         try {
             const contents = window.H5PIntegration?.contents;
             if (!contents) return [];
+
             const results = [];
             for (const key of Object.keys(contents)) {
                 const content = contents[key];
                 let json;
-                try { json = typeof content.jsonContent === 'string' ? JSON.parse(content.jsonContent) : content.jsonContent; }
-                catch (e) { continue; }
+                try {
+                    json = typeof content.jsonContent === 'string'
+                        ? JSON.parse(content.jsonContent)
+                        : content.jsonContent;
+                } catch (e) { continue; }
+
                 const interactions = json?.interactiveVideo?.assets?.interactions;
                 if (!Array.isArray(interactions)) continue;
+
                 for (const ia of interactions) {
                     const t = ia.duration?.from;
-                    if (t !== undefined) {
-                        results.push({
-                            time: t,
-                            wrongSeekTo: ia.adaptivity?.wrong?.seekTo ?? Math.max(0, t - 120),
-                            label: ia.label?.replace(/<[^>]*>/g, '').trim() || '',
-                        });
-                    }
+                    if (t === undefined) continue;
+
+                    const extracted = extractAnswer(ia.action);
+                    results.push({
+                        time: t,
+                        label: stripTags(ia.label || ''),
+                        ...extracted,
+                    });
                 }
             }
+
             results.sort((a, b) => a.time - b.time);
             return results;
-        } catch (e) { return []; }
+        } catch (e) {
+            console.error('[CheatSheet]', e);
+            return [];
+        }
     }
 
-    function getVideoDuration() {
-        try {
-            const contents = window.H5PIntegration?.contents;
-            if (!contents) return null;
-            for (const key of Object.keys(contents)) {
-                const content = contents[key];
-                let json;
-                try { json = typeof content.jsonContent === 'string' ? JSON.parse(content.jsonContent) : content.jsonContent; }
-                catch (e) { continue; }
-                const es = json?.interactiveVideo?.assets?.endscreens;
-                if (Array.isArray(es) && es.length > 0) return es[es.length - 1].time;
-            }
-        } catch (e) {}
-        return null;
-    }
+    // ── Formázás ──────────────────────────────────────────────────────────────
 
     function fmt(s) {
         s = Math.floor(s);
         return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     }
 
-    // ── iframe / doc / video hozzáférés ──────────────────────────────────────
-    function getH5PFrame() { return document.querySelector('iframe.h5p-iframe'); }
+    // ── H5P seek ──────────────────────────────────────────────────────────────
 
-    function getH5PDoc() {
-        try { const f = getH5PFrame(); return f?.contentDocument || f?.contentWindow?.document || null; }
-        catch (e) { return null; }
-    }
-
-    // H5P InteractiveVideo instance-t keressük az iframe window-ban
     function getH5PInstance() {
         try {
-            const win = getH5PFrame()?.contentWindow;
+            const win = document.querySelector('iframe.h5p-iframe')?.contentWindow;
             if (!win?.H5P?.instances) return null;
             for (const inst of win.H5P.instances) {
-                // Közvetlen instance
                 if (inst?.video?.seek) return inst;
-                // Beágyazott
                 if (inst?.instance?.video?.seek) return inst.instance;
             }
         } catch (e) {}
         return null;
     }
 
-    // ── Seek ─────────────────────────────────────────────────────────────────
-    let seekUnlocked = false;
+    function getRawVideo() {
+        try {
+            const doc = document.querySelector('iframe.h5p-iframe')?.contentDocument;
+            return doc?.querySelector('video') || null;
+        } catch (e) { return null; }
+    }
 
-    function doSeek(seconds) {
-        // 1. H5P API
+    // 1 másodperccel a megadott időpont elé teker
+    function seekTo(seconds) {
+        const target = Math.max(0, seconds - 1);
+
         const inst = getH5PInstance();
         if (inst) {
-            try { inst.video.seek(seconds); inst.video.play(); return true; } catch (e) {}
+            try { inst.video.seek(target); inst.video.play(); return true; } catch (e) {}
         }
-        // 2. Nyers video
-        try {
-            const doc = getH5PDoc();
-            const v = doc?.querySelector('video');
-            if (v) { v.currentTime = seconds; if (v.paused) v.play().catch(() => {}); return true; }
-        } catch (e) {}
+
+        const v = getRawVideo();
+        if (v) {
+            v.currentTime = target;
+            v.play().catch(() => {});
+            return true;
+        }
+
         return false;
     }
 
-    function smartSeek(seconds, cb) {
-        if (seekUnlocked) {
-            doSeek(seconds);
-            if (cb) setTimeout(cb, 500);
-            return;
-        }
-        // Unlock: végére tekerünk, majd a célpontra
-        const dur = getVideoDuration() || 99999;
-        setStatus('Seek feloldása (végére teker: ' + fmt(dur) + ')...');
-        doSeek(dur - 0.5);
-        setTimeout(function () {
-            doSeek(seconds);
-            seekUnlocked = true;
-            setStatus('Seek feloldva! Ugras: ' + fmt(seconds));
-            if (cb) setTimeout(cb, 600);
-        }, 1800);
+    // ── AUTO MODE: Válaszok automatikus kitöltése ────────────────────────────
+
+    function getH5PDoc() {
+        try {
+            return document.querySelector('iframe.h5p-iframe')?.contentDocument;
+        } catch (e) { return null; }
     }
 
-    // ── Válasz figyelés – POLLING alapon ─────────────────────────────────────
-    // Nem event-re várunk, hanem 500ms-enként megnézzük az iframe DOM-ját
-    let pollInterval = null;
-    let answerHandled = false;
-
-    function startPolling(interactions) {
-        stopPolling();
-        answerHandled = false;
-        pollInterval = setInterval(function () {
-            if (answerHandled) return;
-            checkForAnswer(interactions);
-        }, 500);
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    function stopPolling() {
-        if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-    }
+    function clickElementByText(doc, text, selector = '*') {
+        if (!text) return false;
+        const cleanText = text.toLowerCase().trim();
+        const elements = Array.from(doc.querySelectorAll(selector));
 
-    function checkForAnswer(interactions) {
-        const doc = getH5PDoc();
-        if (!doc) return;
-
-        // Kérdés ablak látható-e egyáltalán?
-        const questionContainer = doc.querySelector('.h5p-question-content');
-        if (!questionContainer || questionContainer.offsetParent === null) return;
-
-        // Visszajelzés rész látható-e? (ez jelenik meg ellenőrzés után)
-        const feedback = doc.querySelector('.h5p-question-feedback');
-        if (!feedback || feedback.offsetParent === null) return;
-
-        // "Újra" gomb látható = ROSSZ válasz
-        const retryBtn = doc.querySelector('.h5p-question-try-again');
-        if (retryBtn && retryBtn.offsetParent !== null) {
-            answerHandled = true;
-            stopPolling();
-            handleAnswer(interactions, false);
-            return;
-        }
-
-        // Pontszám: minden pont ki van töltve = JÓ válasz
-        const allPts = doc.querySelectorAll('.h5p-joubelui-score-bar-point');
-        const filledPts = doc.querySelectorAll('.h5p-joubelui-score-bar-point.h5p-joubelui-has-score');
-        if (allPts.length > 0 && filledPts.length === allPts.length) {
-            answerHandled = true;
-            stopPolling();
-            handleAnswer(interactions, true);
-            return;
-        }
-
-        // Alternatív: zöld/piros ikon keresése
-        const correct = doc.querySelector('.h5p-correct');
-        const wrong = doc.querySelector('.h5p-wrong');
-        if (correct || wrong) {
-            answerHandled = true;
-            stopPolling();
-            handleAnswer(interactions, !!correct && !wrong);
-            return;
-        }
-
-        // Ha a feedback szekció látható de egyik fenti sem, nézzük a feedback szövegét
-        const feedbackContent = doc.querySelector('.h5p-question-feedback-content');
-        if (feedbackContent && feedbackContent.offsetParent !== null) {
-            // van visszajelzés szöveg – nézzük hogy van-e "Újra" gomb bárhol
-            const anyRetry = doc.querySelector('button.h5p-joubelui-button-retry, .h5p-joubelui-retry, [class*="retry"]');
-            if (anyRetry && anyRetry.offsetParent !== null) {
-                answerHandled = true;
-                stopPolling();
-                handleAnswer(interactions, false);
+        for (const el of elements) {
+            const elText = (el.textContent || '').toLowerCase().trim();
+            if (elText === cleanText || elText.includes(cleanText) || cleanText.includes(elText)) {
+                el.click();
+                return true;
             }
         }
+        return false;
     }
 
-    // ── Fő logika ─────────────────────────────────────────────────────────────
-    let currentIndex = 0;
-    let waiting = false;
+    function fillInputByValue(doc, value) {
+        if (!value) return false;
+        const inputs = doc.querySelectorAll('input[type="text"], input:not([type])');
 
-    // Continue gomb megnyomása, majd várakozás amíg a popup eltűnik
-    function clickContinueAndWait(cb) {
+        for (const input of inputs) {
+            if (!input.value || input.value.trim() === '') {
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async function answerCurrentQuestion(data) {
         const doc = getH5PDoc();
-        if (!doc) { if (cb) cb(); return; }
+        if (!doc) return false;
 
-        // Lehetséges Continue / Folytatás gombok az H5P adaptivity-ban
-        const selectors = [
-            '.h5p-interaction-button',           // fő continue gomb
-            '.h5p-joubelui-button-back',          // back gomb fallback
-            'button.h5p-core-button',             // generikus h5p gomb
-            '[aria-label="Continue"]',
-            '[aria-label="Folytatás"]',
-            'button',                             // utolsó fallback: bármilyen gomb ami látható
+        await wait(800);
+
+        // Próbáljuk meg a válaszokat kitölteni/kattintani
+        let success = false;
+
+        for (const answer of (data.answers || [])) {
+            if (autoAborted) return false;
+
+            // Feleletválasztós, igaz/hamis stb. - gombra/labelre kattintás
+            if (clickElementByText(doc, answer, 'button, label, .h5p-answer, .h5p-alternative')) {
+                success = true;
+                await wait(300);
+            }
+            // Kiegészítős - input mezők
+            else if (fillInputByValue(doc, answer)) {
+                success = true;
+                await wait(300);
+            }
+        }
+
+        await wait(500);
+
+        // Submit/Check gomb keresése és kattintása
+        const submitSelectors = [
+            'button.h5p-question-check-answer',
+            'button.h5p-joubelui-button',
+            '.h5p-question-check-answer',
+            'button[type="submit"]',
+            'button:contains("Check")',
+            'button:contains("Ellenőrzés")'
         ];
 
-        let continueBtn = null;
-        for (const sel of selectors) {
-            const btns = doc.querySelectorAll(sel);
-            for (const btn of btns) {
-                const txt = btn.textContent?.trim().toLowerCase() || '';
-                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                if (
-                    txt.includes('continue') || txt.includes('folytat') ||
-                    aria.includes('continue') || aria.includes('folytat') ||
-                    btn.classList.contains('h5p-interaction-button')
-                ) {
-                    if (btn.offsetParent !== null) { // csak látható gomb
-                        continueBtn = btn;
-                        break;
+        for (const sel of submitSelectors) {
+            const btn = doc.querySelector(sel);
+            if (btn && btn.offsetParent !== null) {
+                await wait(400);
+                btn.click();
+                success = true;
+                break;
+            }
+        }
+
+        return success;
+    }
+
+    async function submitFinalAnswers() {
+        console.log('[AUTO] Keresem a csillag gombot...');
+        const doc = getH5PDoc();
+        if (!doc) return false;
+
+        await wait(1000);
+
+        // A konkrét csillag gomb amit te találtál
+        const starButton = doc.querySelector('.h5p-control.h5p-star[aria-label*="summary"]');
+
+        if (starButton) {
+            console.log('[AUTO] Csillag gomb megtalálva!');
+            await wait(500);
+            starButton.click();
+            await wait(1500);
+
+            // Most keressük a Submit Answers gombot a felugró dialógusban
+            const submitBtn = doc.querySelector('button.h5p-joubelui-button, .h5p-summary-submit-button, button[type="submit"]');
+            if (submitBtn) {
+                const btnText = (submitBtn.textContent || '').toLowerCase();
+                if (btnText.includes('submit') || btnText.includes('beküld')) {
+                    console.log('[AUTO] Submit Answers gomb megtalálva a dialógusban!');
+                    await wait(500);
+                    submitBtn.click();
+                    await wait(1000);
+
+                    // Ha van megerősítő dialógus
+                    const confirmBtn = doc.querySelector('.h5p-confirmation-dialog-confirm-button, button[class*="confirm"]');
+                    if (confirmBtn) {
+                        console.log('[AUTO] Megerősítő gomb megnyomva');
+                        await wait(500);
+                        confirmBtn.click();
+                    }
+
+                    return true;
+                }
+            }
+
+            // Ha nem találtuk a submit gombot, próbáljuk meg az összes gombot végignézni
+            const allButtons = doc.querySelectorAll('button');
+            for (const btn of allButtons) {
+                const text = (btn.textContent || '').toLowerCase();
+                if (text.includes('submit') || text.includes('beküld') || text.includes('leadás')) {
+                    console.log('[AUTO] Submit gomb talált szöveg alapján:', text);
+                    await wait(500);
+                    btn.click();
+                    await wait(1000);
+                    return true;
+                }
+            }
+        } else {
+            console.log('[AUTO] Nem találtam a csillag gombot, próbálom a videó végét...');
+
+            // Ha nincs csillag, menjünk a videó végére
+            const v = getRawVideo();
+            if (v) {
+                v.currentTime = v.duration - 1;
+                await wait(2000);
+
+                // Próbáljuk újra a csillag gombot
+                const starBtn2 = doc.querySelector('.h5p-control.h5p-star');
+                if (starBtn2) {
+                    starBtn2.click();
+                    await wait(1500);
+
+                    const submitBtn = doc.querySelector('button.h5p-joubelui-button, button[type="submit"]');
+                    if (submitBtn) {
+                        submitBtn.click();
+                        return true;
                     }
                 }
             }
-            if (continueBtn) break;
         }
 
-        if (continueBtn) {
-            setStatus('▶ Continue gomb megnyomása...');
-            continueBtn.click();
-        } else {
-            setStatus('(Continue gomb nem található, várakozás...)');
-        }
-
-        // Várjuk amíg a kérdés popup eltűnik (max 8s)
-        let waited = 0;
-        const waitDisappear = setInterval(function () {
-            waited += 300;
-            const doc2 = getH5PDoc();
-            const popup = doc2?.querySelector('.h5p-question-content');
-            const gone = !popup || popup.offsetParent === null;
-            if (gone || waited > 8000) {
-                clearInterval(waitDisappear);
-                if (cb) setTimeout(cb, 400); // kis extra buffer
-            }
-        }, 300);
+        console.log('[AUTO] Nem sikerült leadni - lehet már be van küldve?');
+        return false;
     }
 
-    function handleAnswer(interactions, isCorrect) {
-        waiting = false;
-        const inter = interactions[currentIndex];
-        if (!inter) return;
-
-        if (isCorrect) {
-            setStatus('✅ Helyes! 2mp várakozás...');
-            // 1. Kemény 2mp várakozás
-            setTimeout(function () {
-                // 2. Continue gomb megnyomása + popup eltűnésére várunk
-                clickContinueAndWait(function () {
-                    // 3. Tekerés a következő kérdésre
-                    currentIndex++;
-                    goToInteraction(interactions, currentIndex);
-                });
-            }, 2000);
-        } else {
-            setStatus('❌ Helytelen! ↩ Visszatekerés: <b>' + fmt(inter.wrongSeekTo) + '</b>');
-            setTimeout(function () {
-                // Rossz válasznál is kattintunk Continue/Újra-ra ha van
-                clickContinueAndWait(function () {
-                    smartSeek(inter.wrongSeekTo, function () {
-                        setTimeout(function () {
-                            goToInteraction(interactions, currentIndex);
-                        }, 1500);
-                    });
-                });
-            }, 1500);
-        }
-    }
-
-    function goToInteraction(interactions, index) {
-        stopPolling();
-        answerHandled = false;
-
-        if (index >= interactions.length) {
-            setStatus('🎉 Minden kérdést teljesítettél!');
-            const btn = document.getElementById('autoseek-btn');
-            if (btn) { btn.textContent = 'Kész!'; btn.disabled = false; }
+    async function runAutoMode(questionsData) {
+        if (autoRunning) {
+            console.log('[AUTO] Már fut!');
             return;
         }
 
-        const inter = interactions[index];
-        highlightItem(index, interactions.length);
-        setStatus('<b>' + (index + 1) + '/' + interactions.length + '.</b> kérdés → <b>' + fmt(inter.time) + '</b>');
+        autoRunning = true;
+        autoAborted = false;
 
-        smartSeek(Math.max(0, inter.time - 1.5), function () {
-            // Kérdés megjelenése után indítjuk a polling-ot
-            setTimeout(function () {
-                startPolling(interactions);
-            }, 2000);
-        });
-    }
+        const autoBtn = document.getElementById('cs-auto-btn');
+        if (autoBtn) {
+            autoBtn.textContent = 'STOP AUTO';
+            autoBtn.style.background = '#ff3f3f';
+        }
 
-    // ── Videó / H5P betöltés figyelése ───────────────────────────────────────
-    function startAutoSeek(interactions) {
-        if (!interactions.length) { setStatus('Nem találtam kérdéspontokat!'); return; }
+        console.log('[AUTO] Indítás... ' + questionsData.length + ' kérdés');
 
-        const btn = document.getElementById('autoseek-btn');
-        if (btn) { btn.textContent = 'Fut...'; btn.disabled = true; }
-
-        currentIndex = 0;
-        waiting = false;
-        seekUnlocked = false;
-        stopPolling();
-
-        setStatus('H5P betöltésre vár...');
-
-        let attempts = 0;
-        const wait = setInterval(function () {
-            attempts++;
-            if (attempts > 120) {
-                clearInterval(wait);
-                setStatus('❌ Timeout – töltsd újra az oldalt.');
-                if (btn) { btn.textContent = 'Auto-Seek'; btn.disabled = false; }
-                return;
+        for (let i = 0; i < questionsData.length; i++) {
+            if (autoAborted) {
+                console.log('[AUTO] Megszakítva!');
+                break;
             }
 
-            // Elég ha a videó elem vagy az H5P instance megvan
-            const inst = getH5PInstance();
-            const rawVideo = getH5PDoc()?.querySelector('video');
+            const item = questionsData[i];
+            console.log(`[AUTO] ${i+1}/${questionsData.length} - ${fmt(item.time)} - ${item.type}`);
 
-            if (inst || rawVideo) {
-                clearInterval(wait);
-                setStatus('✅ H5P kész! Indul...');
-                try { if (inst) inst.video.play(); else rawVideo.play().catch(() => {}); } catch (e) {}
-                setTimeout(function () {
-                    setupAnswerWatcher(interactions); // xAPI backup
-                    goToInteraction(interactions, currentIndex);
-                }, 1500);
-            } else if (attempts % 5 === 0) {
-                setStatus('Várakozás... (' + attempts + 's)<br><small>Nyomj Play-t a videón ha nem indul!</small>');
-            }
-        }, 1000);
+            // Ugrás a kérdéshez
+            seekTo(item.time);
+            await wait(2000); // Várunk, hogy betöltődjön a kérdés
+
+            // Válaszolunk
+            await answerCurrentQuestion(item);
+
+            // Extra várakozás a következő kérdés előtt
+            await wait(1500);
+        }
+
+        // Ha nem lett megszakítva, kommitoljuk a válaszokat
+        if (!autoAborted) {
+            console.log('[AUTO] Összes kérdés megválaszolva, kommitolás...');
+            await wait(2000);
+            await submitFinalAnswers();
+        }
+
+        autoRunning = false;
+        if (autoBtn) {
+            autoBtn.textContent = 'AUTO RUN';
+            autoBtn.style.background = '#2a9d5c';
+        }
+
+        console.log('[AUTO] Kész!');
     }
 
-    // xAPI backup – ha a polling valamiért lassú lenne
-    function setupAnswerWatcher(interactions) {
-        window.addEventListener('message', function (ev) {
-            if (answerHandled) return;
-            try {
-                const stmt = ev.data?.statement;
-                if (!stmt) return;
-                const verbId = stmt.verb?.id || '';
-                if (!verbId.includes('answered') && !verbId.includes('completed')) return;
-                const result = stmt.result;
-                const score = result?.score;
-                let isMax = result?.success === true;
-                if (!isMax && score?.raw !== undefined && score?.max !== undefined) isMax = score.raw >= score.max;
-                answerHandled = true;
-                stopPolling();
-                handleAnswer(interactions, isMax);
-            } catch (e) {}
-        });
-    }
+    function stopAutoMode() {
+        autoAborted = true;
+        autoRunning = false;
 
-    // ── UI ────────────────────────────────────────────────────────────────────
-    function createUI(interactions) {
-        const wrapper = document.createElement('div');
-        wrapper.id = 'autoseek-wrapper';
-        Object.assign(wrapper.style, {
-            position: 'fixed', bottom: '20px', right: '20px', zIndex: '99999',
-            display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px',
-            fontFamily: 'sans-serif',
-        });
-
-        const status = document.createElement('div');
-        status.id = 'autoseek-status';
-        Object.assign(status.style, {
-            padding: '8px 12px', background: 'rgba(0,0,0,0.85)', color: '#fff',
-            borderRadius: '8px', fontSize: '13px', maxWidth: '310px',
-            display: 'none', lineHeight: '1.6',
-        });
-
-        const listPanel = document.createElement('div');
-        listPanel.id = 'autoseek-list';
-        Object.assign(listPanel.style, {
-            padding: '10px 14px', background: 'rgba(20,20,40,0.95)', color: '#fff',
-            borderRadius: '10px', fontSize: '12px', maxWidth: '310px',
-            display: 'none', lineHeight: '1.8',
-        });
-        const listTitle = document.createElement('div');
-        listTitle.textContent = 'Kérdéspontok (' + interactions.length + ' db):';
-        Object.assign(listTitle.style, { fontWeight: 'bold', marginBottom: '6px', fontSize: '13px' });
-        listPanel.appendChild(listTitle);
-        interactions.forEach(function (inter, i) {
-            const row = document.createElement('div');
-            row.id = 'autoseek-item-' + i;
-            row.textContent = (i + 1) + '. ' + fmt(inter.time) + (inter.label ? ' – ' + inter.label.substring(0, 30) : '');
-            Object.assign(row.style, { padding: '2px 5px', borderRadius: '4px', transition: 'background 0.3s' });
-            listPanel.appendChild(row);
-        });
-
-        const btnRow = document.createElement('div');
-        Object.assign(btnRow.style, { display: 'flex', gap: '8px' });
-
-        const startBtn = document.createElement('button');
-        startBtn.id = 'autoseek-btn';
-        startBtn.textContent = 'Auto-Seek';
-        styleBtn(startBtn, '#e63946');
-
-        const listBtn = document.createElement('button');
-        listBtn.textContent = 'Lista';
-        styleBtn(listBtn, '#457b9d');
-        listBtn.addEventListener('click', function () {
-            listPanel.style.display = listPanel.style.display === 'none' ? 'block' : 'none';
-        });
-
-        const resetBtn = document.createElement('button');
-        resetBtn.textContent = 'Reset';
-        styleBtn(resetBtn, '#555');
-        resetBtn.addEventListener('click', function () {
-            currentIndex = 0; waiting = false; seekUnlocked = false;
-            stopPolling(); answerHandled = false;
-            setStatus('↺ Visszaállítva.');
-            highlightItem(-1, interactions.length);
-            const btn = document.getElementById('autoseek-btn');
-            if (btn) { btn.textContent = 'Auto-Seek'; btn.disabled = false; }
-        });
-
-        btnRow.appendChild(startBtn);
-        btnRow.appendChild(listBtn);
-        btnRow.appendChild(resetBtn);
-        wrapper.appendChild(status);
-        wrapper.appendChild(listPanel);
-        wrapper.appendChild(btnRow);
-        document.body.appendChild(wrapper);
-
-        startBtn.addEventListener('click', function () { startAutoSeek(interactions); });
-    }
-
-    function styleBtn(btn, bg) {
-        Object.assign(btn.style, {
-            padding: '9px 14px', background: bg, color: '#fff', border: 'none',
-            borderRadius: '8px', fontWeight: 'bold', fontSize: '13px',
-            cursor: 'pointer', boxShadow: '0 3px 10px rgba(0,0,0,0.3)',
-        });
-    }
-
-    function setStatus(msg) {
-        const el = document.getElementById('autoseek-status');
-        if (el) { el.style.display = 'block'; el.innerHTML = msg; }
-        console.log('[AutoSeek]', msg.replace(/<[^>]*>/g, ''));
-    }
-
-    function highlightItem(activeIndex, total) {
-        for (let i = 0; i < total; i++) {
-            const el = document.getElementById('autoseek-item-' + i);
-            if (!el) continue;
-            if (i === activeIndex) Object.assign(el.style, { background: '#e63946', fontWeight: 'bold', opacity: '1' });
-            else if (i < activeIndex) Object.assign(el.style, { background: '#2a9d5c', fontWeight: 'normal', opacity: '0.7' });
-            else Object.assign(el.style, { background: 'transparent', fontWeight: 'normal', opacity: '1' });
+        const autoBtn = document.getElementById('cs-auto-btn');
+        if (autoBtn) {
+            autoBtn.textContent = 'AUTO RUN';
+            autoBtn.style.background = '#2a9d5c';
         }
     }
 
+    // ── UI építés ─────────────────────────────────────────────────────────────
+
+    function buildUI(data) {
+        // Stílusok injektálása
+        const style = document.createElement('style');
+        style.textContent = `
+            #cs-panel {
+                position: fixed;
+                top: 0; right: 0;
+                width: 340px; height: 100vh;
+                background: #0f0f13;
+                color: #e8e6e0;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+                overflow-y: auto;
+                z-index: 999999;
+                box-shadow: -4px 0 24px rgba(0,0,0,0.6);
+                transform: translateX(100%);
+                transition: transform 0.3s cubic-bezier(.4,0,.2,1);
+                border-left: 2px solid #ff3f3f;
+            }
+            #cs-panel.open { transform: translateX(0); }
+
+            #cs-toggle {
+                position: fixed;
+                top: 50%;
+                right: 0;
+                transform: translateY(-50%);
+                z-index: 1000000;
+                background: #ff3f3f;
+                color: #fff;
+                border: none;
+                cursor: pointer;
+                padding: 14px 6px;
+                font-size: 11px;
+                font-family: 'Courier New', monospace;
+                font-weight: bold;
+                letter-spacing: 2px;
+                writing-mode: vertical-rl;
+                text-orientation: mixed;
+                border-radius: 6px 0 0 6px;
+                box-shadow: -2px 0 12px rgba(255,63,63,0.4);
+                transition: right 0.3s cubic-bezier(.4,0,.2,1), background 0.2s;
+            }
+            #cs-toggle:hover { background: #ff6060; }
+            #cs-toggle.shifted { right: 340px; }
+
+            #cs-header {
+                padding: 16px;
+                border-bottom: 1px solid #2a2a33;
+                background: #13131a;
+            }
+            #cs-header h1 {
+                margin: 0 0 4px 0;
+                font-size: 13px;
+                font-weight: bold;
+                color: #ff3f3f;
+                letter-spacing: 3px;
+                text-transform: uppercase;
+            }
+            #cs-header p {
+                margin: 0 0 12px 0;
+                color: #666;
+                font-size: 11px;
+            }
+
+            #cs-auto-btn {
+                width: 100%;
+                background: #2a9d5c;
+                color: #fff;
+                border: none;
+                padding: 12px;
+                font-size: 13px;
+                font-weight: bold;
+                letter-spacing: 2px;
+                cursor: pointer;
+                border-radius: 4px;
+                font-family: 'Courier New', monospace;
+                transition: all 0.2s;
+                box-shadow: 0 4px 12px rgba(42, 157, 92, 0.3);
+            }
+            #cs-auto-btn:hover {
+                background: #35c275;
+                transform: translateY(-2px);
+                box-shadow: 0 6px 16px rgba(42, 157, 92, 0.4);
+            }
+            #cs-auto-btn:active {
+                transform: translateY(0);
+            }
+
+            .cs-item {
+                border-bottom: 1px solid #1e1e28;
+                padding: 12px 16px;
+                transition: background 0.15s;
+            }
+            .cs-item:hover { background: #1a1a22; }
+
+            .cs-time {
+                display: inline-block;
+                background: #ff3f3f;
+                color: #fff;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 2px 7px;
+                border-radius: 3px;
+                letter-spacing: 1px;
+                margin-bottom: 6px;
+                cursor: pointer;
+                transition: background 0.15s, transform 0.1s;
+                user-select: none;
+            }
+            .cs-time:hover {
+                background: #ff6a6a;
+                transform: scale(1.08);
+            }
+            .cs-time:active {
+                transform: scale(0.96);
+            }
+            .cs-time::after {
+                content: ' ▶';
+                font-size: 9px;
+                opacity: 0.7;
+            }
+            .cs-jumped {
+                background: #2a9d5c !important;
+            }
+            .cs-type {
+                display: inline-block;
+                margin-left: 6px;
+                color: #444;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .cs-question {
+                color: #aaa;
+                font-size: 11px;
+                margin: 4px 0 6px 0;
+                line-height: 1.5;
+                font-style: italic;
+            }
+            .cs-answers {
+                list-style: none;
+                margin: 0; padding: 0;
+            }
+            .cs-answers li {
+                padding: 4px 0 4px 14px;
+                position: relative;
+                color: #7eff9a;
+                font-size: 12px;
+                line-height: 1.4;
+            }
+            .cs-answers li::before {
+                content: '▸';
+                position: absolute;
+                left: 0;
+                color: #ff3f3f;
+            }
+            .cs-no-answer {
+                color: #444;
+                font-size: 11px;
+                font-style: italic;
+            }
+            #cs-panel::-webkit-scrollbar { width: 4px; }
+            #cs-panel::-webkit-scrollbar-track { background: #0f0f13; }
+            #cs-panel::-webkit-scrollbar-thumb { background: #ff3f3f; border-radius: 2px; }
+        `;
+        document.head.appendChild(style);
+
+        // Panel
+        const panel = document.createElement('div');
+        panel.id = 'cs-panel';
+
+        // Header
+        const header = document.createElement('div');
+        header.id = 'cs-header';
+        header.innerHTML = `
+            <h1>Cheat Sheet</h1>
+            <p>${data.length} kérdéspont találva</p>
+        `;
+
+        // AUTO gomb
+        const autoBtn = document.createElement('button');
+        autoBtn.id = 'cs-auto-btn';
+        autoBtn.textContent = 'AUTO RUN';
+        autoBtn.addEventListener('click', function() {
+            if (autoRunning) {
+                stopAutoMode();
+            } else {
+                runAutoMode(data);
+            }
+        });
+        header.appendChild(autoBtn);
+
+        panel.appendChild(header);
+
+        // Kérdés lista
+        data.forEach(function (item, i) {
+            const div = document.createElement('div');
+            div.className = 'cs-item';
+
+            const timeEl = document.createElement('span');
+            timeEl.className = 'cs-time';
+            timeEl.textContent = fmt(item.time);
+            timeEl.title = 'Ugrás: ' + fmt(Math.max(0, item.time - 1));
+            timeEl.addEventListener('click', function () {
+                const ok = seekTo(item.time);
+                if (ok) {
+                    timeEl.classList.add('cs-jumped');
+                    setTimeout(function () { timeEl.classList.remove('cs-jumped'); }, 2000);
+                } else {
+                    timeEl.textContent = '✗ ' + fmt(item.time);
+                    setTimeout(function () { timeEl.textContent = fmt(item.time); }, 2000);
+                }
+            });
+
+            const typeEl = document.createElement('span');
+            typeEl.className = 'cs-type';
+            typeEl.textContent = item.type || '';
+
+            const topRow = document.createElement('div');
+            topRow.appendChild(timeEl);
+            topRow.appendChild(typeEl);
+            div.appendChild(topRow);
+
+            if (item.question) {
+                const q = document.createElement('div');
+                q.className = 'cs-question';
+                q.textContent = item.question.length > 120
+                    ? item.question.substring(0, 120) + '…'
+                    : item.question;
+                div.appendChild(q);
+            }
+
+            const answers = item.answers || [];
+            if (answers.length > 0) {
+                const ul = document.createElement('ul');
+                ul.className = 'cs-answers';
+                answers.forEach(function (ans) {
+                    if (!ans) return;
+                    const li = document.createElement('li');
+                    li.textContent = ans;
+                    ul.appendChild(li);
+                });
+                div.appendChild(ul);
+            } else {
+                const noAns = document.createElement('div');
+                noAns.className = 'cs-no-answer';
+                noAns.textContent = '(nem sikerült kiolvasni a választ)';
+                div.appendChild(noAns);
+            }
+
+            panel.appendChild(div);
+        });
+
+        document.body.appendChild(panel);
+
+        // Toggle gomb
+        const toggle = document.createElement('button');
+        toggle.id = 'cs-toggle';
+        toggle.textContent = 'CHEAT';
+        document.body.appendChild(toggle);
+
+        toggle.addEventListener('click', function () {
+            const open = panel.classList.toggle('open');
+            toggle.classList.toggle('shifted', open);
+        });
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
+
     function init() {
         setTimeout(function () {
-            const interactions = parseInteractions();
-            console.log('[AutoSeek] ' + interactions.length + ' interakció:', interactions);
-            createUI(interactions);
-            if (!interactions.length) {
-                setStatus('⚠️ Nem találtam H5P interakciókat.');
-                document.getElementById('autoseek-status').style.display = 'block';
+            const data = collectData();
+            console.log('[CheatSheet]', data.length + ' kérdés:', data);
+
+            if (!data.length) {
+                console.warn('[CheatSheet] Nem találtam H5P adatokat.');
+                return;
             }
+
+            buildUI(data);
         }, 2500);
     }
 
